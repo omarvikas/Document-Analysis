@@ -1,16 +1,13 @@
 import streamlit as st
 import os
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.chat_models import ChatOpenAI
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
-from langchain.schema import Document
 import tempfile
-import io
-from typing import List, Optional
+import openai
+from typing import List, Dict, Any
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import PyPDF2
+import re
 
 # Page configuration
 st.set_page_config(
@@ -23,10 +20,8 @@ st.set_page_config(
 # Initialize session state
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
-if "qa_chain" not in st.session_state:
-    st.session_state.qa_chain = None
+if "document_chunks" not in st.session_state:
+    st.session_state.document_chunks = []
 if "document_summary" not in st.session_state:
     st.session_state.document_summary = None
 if "document_sentiment" not in st.session_state:
@@ -35,87 +30,121 @@ if "starter_questions" not in st.session_state:
     st.session_state.starter_questions = []
 if "document_processed" not in st.session_state:
     st.session_state.document_processed = False
+if "vectorizer" not in st.session_state:
+    st.session_state.vectorizer = None
+if "tfidf_matrix" not in st.session_state:
+    st.session_state.tfidf_matrix = None
 
-class DocumentProcessor:
-    """Handles document processing and analysis"""
+class SimpleRAGProcessor:
+    """A simple RAG processor using OpenAI API directly and TF-IDF for document search"""
     
-    def __init__(self, openai_api_key: str):
-        self.embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
-        self.llm = ChatOpenAI(
-            temperature=0,
-            openai_api_key=openai_api_key,
-            model_name="gpt-3.5-turbo"
-        )
+    def __init__(self, api_key: str):
+        self.client = openai.OpenAI(api_key=api_key)
         
-    def load_pdf(self, uploaded_file) -> List[Document]:
-        """Load and process PDF file"""
+    def load_pdf(self, uploaded_file) -> str:
+        """Load and extract text from PDF"""
         try:
             # Save uploaded file temporarily
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
                 tmp_file.write(uploaded_file.getvalue())
                 tmp_file_path = tmp_file.name
             
-            # Load PDF
-            loader = PyPDFLoader(tmp_file_path)
-            documents = loader.load()
+            # Extract text from PDF
+            text = ""
+            with open(tmp_file_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                for page in pdf_reader.pages:
+                    text += page.extract_text() + "\n"
             
             # Clean up temp file
             os.unlink(tmp_file_path)
             
-            return documents
+            return text.strip()
+            
         except Exception as e:
             st.error(f"Error loading PDF: {str(e)}")
-            return []
+            return ""
     
-    def create_vectorstore(self, documents: List[Document]):
-        """Create vector store from documents"""
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len
+    def chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+        """Split text into overlapping chunks"""
+        if not text:
+            return []
+            
+        words = text.split()
+        chunks = []
+        
+        for i in range(0, len(words), chunk_size - overlap):
+            chunk = " ".join(words[i:i + chunk_size])
+            if chunk.strip():
+                chunks.append(chunk.strip())
+                
+        return chunks
+    
+    def create_vectorstore(self, chunks: List[str]):
+        """Create TF-IDF vectorstore for similarity search"""
+        if not chunks:
+            return None, None
+            
+        vectorizer = TfidfVectorizer(
+            max_features=1000,
+            stop_words='english',
+            ngram_range=(1, 2)
         )
         
-        # Split documents
-        splits = text_splitter.split_documents(documents)
-        
-        # Create vectorstore
-        vectorstore = FAISS.from_documents(splits, self.embeddings)
-        return vectorstore
+        tfidf_matrix = vectorizer.fit_transform(chunks)
+        return vectorizer, tfidf_matrix
     
-    def generate_summary(self, documents: List[Document]) -> str:
+    def search_similar_chunks(self, query: str, vectorizer, tfidf_matrix, chunks: List[str], top_k: int = 3) -> List[str]:
+        """Find most similar chunks to query"""
+        if not vectorizer or tfidf_matrix is None:
+            return []
+            
+        try:
+            query_vector = vectorizer.transform([query])
+            similarities = cosine_similarity(query_vector, tfidf_matrix).flatten()
+            top_indices = similarities.argsort()[-top_k:][::-1]
+            
+            return [chunks[i] for i in top_indices if similarities[i] > 0.1]
+        except:
+            return chunks[:top_k] if chunks else []
+    
+    def call_openai(self, prompt: str, max_tokens: int = 500) -> str:
+        """Call OpenAI API"""
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=0
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            return f"Error calling OpenAI: {str(e)}"
+    
+    def generate_summary(self, text: str) -> str:
         """Generate document summary"""
-        # Combine all document content
-        full_text = "\n".join([doc.page_content for doc in documents])
+        # Truncate if too long
+        if len(text) > 12000:
+            text = text[:12000] + "..."
         
-        # Truncate if too long (to avoid token limits)
-        if len(full_text) > 8000:
-            full_text = full_text[:8000] + "..."
-        
-        summary_prompt = f"""
+        prompt = f"""
         Please provide a comprehensive summary of the following document in exactly 250 words. 
         Focus on the main topics, key points, and important information:
 
-        {full_text}
+        {text}
 
         Summary (250 words):
         """
         
-        try:
-            response = self.llm.predict(summary_prompt)
-            return response.strip()
-        except Exception as e:
-            return f"Error generating summary: {str(e)}"
+        return self.call_openai(prompt, max_tokens=300)
     
-    def analyze_sentiment(self, documents: List[Document]) -> str:
+    def analyze_sentiment(self, text: str) -> str:
         """Analyze document sentiment"""
-        # Combine all document content
-        full_text = "\n".join([doc.page_content for doc in documents])
-        
         # Truncate if too long
-        if len(full_text) > 6000:
-            full_text = full_text[:6000] + "..."
+        if len(text) > 8000:
+            text = text[:8000] + "..."
         
-        sentiment_prompt = f"""
+        prompt = f"""
         Analyze the sentiment and tone of the following document. Provide:
         1. Overall sentiment (Positive/Negative/Neutral)
         2. Confidence level (High/Medium/Low)
@@ -123,86 +152,77 @@ class DocumentProcessor:
         4. Brief explanation (2-3 sentences)
 
         Document text:
-        {full_text}
+        {text}
 
         Sentiment Analysis:
         """
         
-        try:
-            response = self.llm.predict(sentiment_prompt)
-            return response.strip()
-        except Exception as e:
-            return f"Error analyzing sentiment: {str(e)}"
+        return self.call_openai(prompt, max_tokens=200)
     
-    def generate_starter_questions(self, documents: List[Document]) -> List[str]:
+    def generate_starter_questions(self, text: str) -> List[str]:
         """Generate conversation starter questions"""
-        # Combine all document content
-        full_text = "\n".join([doc.page_content for doc in documents])
-        
         # Truncate if too long
-        if len(full_text) > 6000:
-            full_text = full_text[:6000] + "..."
+        if len(text) > 8000:
+            text = text[:8000] + "..."
         
-        questions_prompt = f"""
+        prompt = f"""
         Based on the following document, generate exactly 2 thoughtful conversation starter questions 
         that would help someone explore the main topics and key insights. Make them specific and engaging.
 
         Document text:
-        {full_text}
+        {text}
 
-        Please provide exactly 2 questions, one per line, without numbering:
+        Please provide exactly 2 questions, one per line, without numbering or bullets:
         """
         
         try:
-            response = self.llm.predict(questions_prompt)
-            questions = [q.strip() for q in response.strip().split('\n') if q.strip()]
-            # Take only first 2 questions and clean them
-            questions = [q.lstrip('12.-• ').strip() for q in questions[:2]]
-            return questions
-        except Exception as e:
-            return ["What are the main topics discussed in this document?", 
-                   "What are the key insights from this document?"]
-
-def create_qa_chain(vectorstore, openai_api_key: str):
-    """Create QA chain with custom prompt"""
+            response = self.call_openai(prompt, max_tokens=150)
+            questions = [q.strip() for q in response.split('\n') if q.strip()]
+            # Clean and take first 2
+            cleaned_questions = []
+            for q in questions[:2]:
+                q = re.sub(r'^[0-9\.\-\*\•\s]+', '', q).strip()
+                if q and q.endswith('?'):
+                    cleaned_questions.append(q)
+            
+            if len(cleaned_questions) < 2:
+                cleaned_questions.extend([
+                    "What are the main topics discussed in this document?",
+                    "What are the key insights from this document?"
+                ])
+                
+            return cleaned_questions[:2]
+        except:
+            return [
+                "What are the main topics discussed in this document?",
+                "What are the key insights from this document?"
+            ]
     
-    # Custom prompt template
-    prompt_template = """
-    You are a helpful assistant that answers questions based ONLY on the provided context from the uploaded document.
+    def answer_question(self, question: str, relevant_chunks: List[str]) -> str:
+        """Answer question based on relevant document chunks"""
+        if not relevant_chunks:
+            return "I can only answer questions based on the uploaded document. This information is not available in the current document."
+        
+        context = "\n\n".join(relevant_chunks)
+        
+        prompt = f"""
+        You are a helpful assistant that answers questions based ONLY on the provided context from the uploaded document.
 
-    IMPORTANT RULES:
-    1. Only answer questions using information from the context below
-    2. If the answer cannot be found in the context, politely decline and say "I can only answer questions based on the uploaded document. This information is not available in the current document."
-    3. Be precise and cite specific parts of the document when possible
-    4. Do not make up or infer information not explicitly stated in the context
+        IMPORTANT RULES:
+        1. Only answer questions using information from the context below
+        2. If the answer cannot be found in the context, politely decline and say "I can only answer questions based on the uploaded document. This information is not available in the current document."
+        3. Be precise and cite specific parts of the document when possible
+        4. Do not make up or infer information not explicitly stated in the context
 
-    Context: {context}
+        Context from document:
+        {context}
 
-    Question: {question}
+        Question: {question}
 
-    Answer:
-    """
-    
-    PROMPT = PromptTemplate(
-        template=prompt_template, 
-        input_variables=["context", "question"]
-    )
-    
-    llm = ChatOpenAI(
-        temperature=0,
-        openai_api_key=openai_api_key,
-        model_name="gpt-3.5-turbo"
-    )
-    
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
-        chain_type_kwargs={"prompt": PROMPT},
-        return_source_documents=True
-    )
-    
-    return qa_chain
+        Answer:
+        """
+        
+        return self.call_openai(prompt, max_tokens=400)
 
 def main():
     st.title("📚 Document RAG Chatbot")
@@ -231,39 +251,47 @@ def main():
         
         if uploaded_file and openai_api_key:
             if st.button("Process Document", type="primary"):
-                with st.spinner("Processing document..."):
-                    processor = DocumentProcessor(openai_api_key)
-                    
-                    # Load PDF
-                    documents = processor.load_pdf(uploaded_file)
-                    
-                    if documents:
-                        # Create vectorstore
-                        vectorstore = processor.create_vectorstore(documents)
-                        st.session_state.vectorstore = vectorstore
+                try:
+                    with st.spinner("Processing document..."):
+                        processor = SimpleRAGProcessor(openai_api_key)
                         
-                        # Create QA chain
-                        qa_chain = create_qa_chain(vectorstore, openai_api_key)
-                        st.session_state.qa_chain = qa_chain
+                        # Load PDF
+                        document_text = processor.load_pdf(uploaded_file)
                         
-                        # Generate analysis
-                        with st.spinner("Generating summary..."):
-                            summary = processor.generate_summary(documents)
-                            st.session_state.document_summary = summary
-                        
-                        with st.spinner("Analyzing sentiment..."):
-                            sentiment = processor.analyze_sentiment(documents)
-                            st.session_state.document_sentiment = sentiment
-                        
-                        with st.spinner("Generating starter questions..."):
-                            questions = processor.generate_starter_questions(documents)
-                            st.session_state.starter_questions = questions
-                        
-                        st.session_state.document_processed = True
-                        st.session_state.messages = []  # Clear previous chat
-                        
-                        st.success("Document processed successfully!")
-                        st.rerun()
+                        if document_text:
+                            # Create chunks
+                            chunks = processor.chunk_text(document_text)
+                            st.session_state.document_chunks = chunks
+                            
+                            # Create vectorstore
+                            vectorizer, tfidf_matrix = processor.create_vectorstore(chunks)
+                            st.session_state.vectorizer = vectorizer
+                            st.session_state.tfidf_matrix = tfidf_matrix
+                            
+                            # Generate analysis
+                            with st.spinner("Generating summary..."):
+                                summary = processor.generate_summary(document_text)
+                                st.session_state.document_summary = summary
+                            
+                            with st.spinner("Analyzing sentiment..."):
+                                sentiment = processor.analyze_sentiment(document_text)
+                                st.session_state.document_sentiment = sentiment
+                            
+                            with st.spinner("Generating starter questions..."):
+                                questions = processor.generate_starter_questions(document_text)
+                                st.session_state.starter_questions = questions
+                            
+                            st.session_state.document_processed = True
+                            st.session_state.messages = []  # Clear previous chat
+                            
+                            st.success("Document processed successfully!")
+                            st.rerun()
+                        else:
+                            st.error("Could not extract text from the PDF. Please try a different file.")
+                            
+                except Exception as e:
+                    st.error(f"Error processing document: {str(e)}")
+                    st.error("Please check your OpenAI API key and try again.")
     
     # Main content area
     if not openai_api_key:
@@ -298,7 +326,6 @@ def main():
         with col1:
             if len(st.session_state.starter_questions) > 0:
                 if st.button(st.session_state.starter_questions[0], key="q1"):
-                    # Add question to chat
                     st.session_state.messages.append({
                         "role": "user", 
                         "content": st.session_state.starter_questions[0]
@@ -308,7 +335,6 @@ def main():
         with col2:
             if len(st.session_state.starter_questions) > 1:
                 if st.button(st.session_state.starter_questions[1], key="q2"):
-                    # Add question to chat
                     st.session_state.messages.append({
                         "role": "user", 
                         "content": st.session_state.starter_questions[1]
@@ -336,8 +362,18 @@ def main():
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 try:
-                    result = st.session_state.qa_chain({"query": prompt})
-                    response = result["result"]
+                    processor = SimpleRAGProcessor(openai_api_key)
+                    
+                    # Find relevant chunks
+                    relevant_chunks = processor.search_similar_chunks(
+                        prompt, 
+                        st.session_state.vectorizer,
+                        st.session_state.tfidf_matrix,
+                        st.session_state.document_chunks
+                    )
+                    
+                    # Generate answer
+                    response = processor.answer_question(prompt, relevant_chunks)
                     
                     st.markdown(response)
                     
